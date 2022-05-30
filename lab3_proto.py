@@ -1,16 +1,162 @@
 import numpy as np
 from lab1_tools import *
 from lab3_tools import *
+from lab2_proto import *
+from lab2_tools import *
 from scipy import signal, fftpack, cluster
+import os
+from prondict import prondict
+from tqdm import tqdm
 
+def save_data(path):
+    phoneHMMs = np.load('lab2_models_all.npz', allow_pickle=True)['phoneHMMs'].item()
+    stateList = list(np.load('state_list.npz', allow_pickle=True)['state_list'])
+    phones = sorted(phoneHMMs.keys())
+    data = []
+    for root, dirs, files in tqdm(os.walk(path)):
+        for file in files:
+            if file.endswith('.wav'):
+                filename = os.path.join(root, file)
+                samples, samplingrate = loadAudio(filename)
+                #...your code for feature extraction and forced alignment
+                lmfcc, mspecs = mfcc(samples)
+
+                wordTrans = list(path2info(filename)[2])
+                phoneTrans = words2phones(wordTrans, prondict)
+
+                nstates = {phone: phoneHMMs[phone]['means'].shape[0] for phone in phones}
+
+                utteranceHMM = concatHMMs(phoneHMMs, phoneTrans)
+
+                stateTrans = [phone + '_' + str(stateid) for phone in phoneTrans for stateid in range(nstates[phone])]
+
+                obsloglik = log_multivariate_normal_density_diag(lmfcc, utteranceHMM['means'], utteranceHMM['covars'])
+                viterbiLoglik, viterbiPath = viterbi(obsloglik, np.log(utteranceHMM['startprob']), np.log(utteranceHMM['transmat']))
+
+                viterbiStateTrans = [stateTrans[int(i)] for i in viterbiPath]
+
+                targets = [stateList.index(ph) for ph in viterbiStateTrans]
+                print(filename)
+                print(len(lmfcc))
+                data.append({'filename': filename, 'lmfcc': lmfcc,
+                                'mspec': mspecs, 'targets': targets})
+    return data
+
+def split_data(path):
+    """
+    return:
+    train: list of dicts containing 90% of data
+    val: list of dicts containing 10% of data
+    """
+    train = []
+    val = []
+    data = np.load(path, allow_pickle=True)['traindata'] #8623 dicts
+    men = []
+    women = []
+    for i in range(len(data)):
+        split_path = data[i]['filename'].split('/')
+        if split_path[4] == 'woman': #woman
+            women.append(split_path[5])
+        else:
+            men.append(split_path[5])
+        
+    men = list(set(men))
+    women = list(set(women))
+
+    men_train = men[:int(len(men)*0.9)]
+    women_train = women[:int(len(women)*0.9)]
+    men_val = men[int(len(men)*0.9):]
+    women_val = women[int(len(women)*0.9):]
+    
+    train_spkrs = men_train + women_train
+    val_spkrs = men_val + women_val
+
+    for i in range(len(data)):
+        split_path = data[i]['filename'].split('/')
+        if split_path[5] in train_spkrs:
+            train.append(data[i])
+        else:
+            val.append(data[i])
+    
+    return train, val
+
+def stack_acoustic_context_old(data):
+    """
+    takes a list of dicts
+    returns a stacked version
+    """
+    for rec in data:
+        N, feats = rec['lmfcc'].shape
+        rec['lmfcc_stacked'] = np.zeros((N, feats, 7))
+        for i in range(N):
+            extended = []
+            for k in range(-3, 4):
+                index = abs(i+k)
+                if index > (N-1):
+                    index = (N-1) - (index%(N-1))
+                extended.append(rec['lmfcc'][index])
+            rec['lmfcc_stacked'][i] = np.array(extended).T
+
+    return data
+
+def stack_acoustic_context(data, param):
+    """
+    takes a list of dicts
+    returns a stacked version
+    """
+    for rec in data:
+        N, feats = rec[param].shape
+        rec[param+'_stacked'] = np.zeros((N, feats, 7))
+        for i in range(N):
+            extended = []
+            for k in range(-3, 4):
+                index = abs(i+k)
+                if index > (N-1):
+                    index = (N-1) - (index%(N-1))
+                extended.append(rec[param][index])
+            rec[param+'_stacked'][i] = np.array(extended).T
+
+    return data
+
+
+
+def data_reshape(data, param, stacked):
+    _, d = data[0][param].shape
+    key = param+'_stacked' if stacked else param
+    dim = d*7 if stacked else d
+
+    data = [rec[key].reshape((rec[key].shape[0], dim)) for rec in data]
+    data = np.array(np.concatenate(data, axis=0))
+
+    return data
+
+def targets_reshape(data):
+    data = [rec['targets'] for rec in data]
+    data = np.array(np.concatenate(data, axis=0))
+
+    return data
+
+
+def get_scalar(data, param, stacked):
+    """
+    inputs the data to standardize over
+    returns the scalar used to standardize 
+    """
+    from sklearn.preprocessing import StandardScaler
+
+    scaler = StandardScaler()
+    data = data_reshape(data, param, stacked)
+    scaler.fit(data)
+
+    return scaler
 
 def enumerate_states():
-   phoneHMMs = np.load('lab2_models_all.npz', allow_pickle=True)['phoneHMMs'].item()
-   phones = sorted(phoneHMMs.keys())
-   nstates = {phone: phoneHMMs[phone]['means'].shape[0] for phone in phones}
-   stateList = [ph + '_' + str(id) for ph in phones for id in range(nstates[ph])]
+    phoneHMMs = np.load('lab2_models_all.npz', allow_pickle=True)['phoneHMMs'].item()
+    phones = sorted(phoneHMMs.keys())
+    nstates = {phone: phoneHMMs[phone]['means'].shape[0] for phone in phones}
+    stateList = [ph + '_' + str(id) for ph in phones for id in range(nstates[ph])]
 
-   return stateList
+    return stateList
 
 def words2phones(wordList, pronDict, addSilence=True, addShortPause=True):
     """ word2phones: converts word level to phone level transcription adding silence
@@ -23,6 +169,17 @@ def words2phones(wordList, pronDict, addSilence=True, addShortPause=True):
     Output:
        list of phone symbols
     """
+    phone_list = []
+    if addSilence:
+        phone_list.append('sil')
+    for word in wordList:
+        [phone_list.append(w) for w in pronDict[word]]
+        if addShortPause:
+            phone_list.append('sp')
+    if addSilence:
+        phone_list.append('sil')
+    
+    return phone_list
 
 def forcedAlignment(lmfcc, phoneHMMs, phoneTrans):
     """ forcedAlignmen: aligns a phonetic transcription at the state level
@@ -107,8 +264,7 @@ def mfcc(samples, winlen = 400, winshift = 200, preempcoeff=0.97, nfft=512, ncep
     """
     mspecs = mspec(samples, winlen, winshift, preempcoeff, nfft, samplingrate)
     ceps = cepstrum(mspecs, nceps)
-    return lifter(ceps, liftercoeff)
-
+    return lifter(ceps, liftercoeff), mspecs #har lagt till mspecs här
 
 def enframe(samples, winlen, winshift):
     """
@@ -157,7 +313,6 @@ def preemp(input, p=0.97):
     
     return signal.lfilter(b, a, input)
     
-
 def windowing(input):
     """
     Applies hamming window to the input frames.

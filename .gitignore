@@ -3,3 +3,4 @@ tidigits/
 tidigitsSPH/
 __pycache__/
 *.wav
+*.npz
